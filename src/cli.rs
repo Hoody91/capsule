@@ -1,8 +1,29 @@
-use anyhow::{Result, bail};
+use std::fmt;
 
 pub const USAGE: &str = "usage: capsule run [--hostname NAME] <command> [args...]";
 
 const PROC_HOSTNAME: &str = "capsule";
+
+#[derive(Debug, PartialEq)]
+pub enum CliError {
+    MissingSubcommand,
+    UnknownSubcommand(String),
+    MissingHostnameValue,
+    MissingCommand,
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::MissingSubcommand => write!(f, "missing subcommand"),
+            CliError::UnknownSubcommand(name) => write!(f, "unknown subcommand '{name}'"),
+            CliError::MissingHostnameValue => write!(f, "--hostname needs a value"),
+            CliError::MissingCommand => write!(f, "missing command to run"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
 
 #[derive(Debug)]
 pub struct Config {
@@ -12,11 +33,11 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(mut args: impl Iterator<Item = String>) -> Result<Config> {
+    pub fn new(mut args: impl Iterator<Item = String>) -> Result<Config, CliError> {
         match args.next().as_deref() {
             Some("run") => {}
-            Some(other) => bail!("unknown subcommand '{other}'"),
-            None => bail!("missing subcommand"),
+            Some(other) => return Err(CliError::UnknownSubcommand(other.to_string())),
+            None => return Err(CliError::MissingSubcommand),
         }
 
         let mut hostname = String::from(PROC_HOSTNAME);
@@ -26,7 +47,7 @@ impl Config {
             match arg.as_str() {
                 "--hostname" if rest.is_empty() => match args.next() {
                     Some(h) => hostname = h,
-                    None => bail!("--hostname needs a value"),
+                    None => return Err(CliError::MissingHostnameValue),
                 },
                 _ => {
                     rest.push(arg);
@@ -37,7 +58,7 @@ impl Config {
 
         let mut rest = rest.into_iter();
         let Some(command) = rest.next() else {
-            bail!("missing command to run");
+            return Err(CliError::MissingCommand);
         };
 
         Ok(Config {
@@ -52,12 +73,12 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<Config> {
+    fn parse(args: &[&str]) -> Result<Config, CliError> {
         Config::new(args.iter().map(|s| s.to_string()))
     }
 
-    fn parse_err(args: &[&str]) -> String {
-        parse(args).unwrap_err().to_string()
+    fn parse_err(args: &[&str]) -> CliError {
+        parse(args).unwrap_err()
     }
 
     #[test]
@@ -105,24 +126,27 @@ mod tests {
 
     #[test]
     fn missing_subcommand() {
-        assert_eq!(parse_err(&[]), "missing subcommand");
+        assert_eq!(parse_err(&[]), CliError::MissingSubcommand);
     }
 
     #[test]
     fn unknown_subcommand() {
-        assert_eq!(parse_err(&["exec", "sh"]), "unknown subcommand 'exec'");
+        assert_eq!(
+            parse_err(&["exec", "sh"]),
+            CliError::UnknownSubcommand("exec".to_string())
+        );
     }
 
     #[test]
     fn missing_command() {
-        assert_eq!(parse_err(&["run"]), "missing command to run");
+        assert_eq!(parse_err(&["run"]), CliError::MissingCommand);
     }
 
     #[test]
     fn missing_command_after_hostname() {
         assert_eq!(
             parse_err(&["run", "--hostname", "box"]),
-            "missing command to run"
+            CliError::MissingCommand
         );
     }
 
@@ -130,7 +154,27 @@ mod tests {
     fn hostname_without_value() {
         assert_eq!(
             parse_err(&["run", "--hostname"]),
+            CliError::MissingHostnameValue
+        );
+    }
+
+    #[test]
+    fn display_messages() {
+        assert_eq!(
+            CliError::MissingSubcommand.to_string(),
+            "missing subcommand"
+        );
+        assert_eq!(
+            CliError::UnknownSubcommand("exec".to_string()).to_string(),
+            "unknown subcommand 'exec'"
+        );
+        assert_eq!(
+            CliError::MissingHostnameValue.to_string(),
             "--hostname needs a value"
+        );
+        assert_eq!(
+            CliError::MissingCommand.to_string(),
+            "missing command to run"
         );
     }
 }

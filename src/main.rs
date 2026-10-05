@@ -10,7 +10,7 @@ fn main() -> ExitCode {
         Ok(config) => match container::run(&config) {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
-                eprintln!("capsule: {e:#}");
+                eprintln!("capsule: {e}");
                 ExitCode::from(125)
             }
         },
