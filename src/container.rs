@@ -11,12 +11,14 @@ use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, clone};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{Pid, close, execvpe, pipe2, read, sethostname, write};
+use nix::unistd::{
+    Gid, Pid, Uid, close, execvpe, getegid, geteuid, pipe2, read, sethostname, write,
+};
 
 use crate::cgroup::Cgroup;
 use crate::cli::{Config, NetworkMode};
 use crate::network::{self, Network};
-use crate::rootfs;
+use crate::{rootfs, security, userns};
 
 const STACK_SIZE: usize = 1024 * 1024;
 
@@ -36,6 +38,9 @@ pub enum Error {
     Nft(String),
     NoFreeAddress,
     Network { path: PathBuf, source: io::Error },
+    LimitsNeedRoot,
+    UserNamespace { path: PathBuf, source: io::Error },
+    Security { op: &'static str, source: Errno },
     Clone(Errno),
     Wait(Errno),
     UnexpectedWaitStatus(WaitStatus),
@@ -72,6 +77,14 @@ impl fmt::Display for Error {
             Error::Network { path, source } => {
                 write!(f, "network setup {}: {source}", path.display())
             }
+            Error::LimitsNeedRoot => write!(
+                f,
+                "--memory, --pids and --cpus need root (cgroups can't be created rootless)"
+            ),
+            Error::UserNamespace { path, source } => {
+                write!(f, "user namespace {}: {source}", path.display())
+            }
+            Error::Security { op, source } => write!(f, "{op}: {source}"),
             Error::Clone(e) => write!(f, "clone failed (are you root?): {e}"),
             Error::Wait(e) => write!(f, "waitpid failed: {e}"),
             Error::UnexpectedWaitStatus(status) => write!(f, "unexpected wait status: {status:?}"),
@@ -112,6 +125,14 @@ pub fn run(config: &Config) -> Result<u8, Error> {
         return Err(Error::RootfsNotDir(rootfs));
     }
 
+    // Without root, capsule makes its own user namespace and maps our ids to
+    // root inside it, so the other namespaces can be created unprivileged.
+    let rootless = !geteuid().is_root();
+    if rootless && !config.limits.is_empty() {
+        return Err(Error::LimitsNeedRoot);
+    }
+    let id_map = rootless.then(|| (geteuid(), getegid()));
+
     // Created before the child exists, so a bad host setup fails cheaply.
     let cgroup = if config.limits.is_empty() {
         None
@@ -122,7 +143,13 @@ pub fn run(config: &Config) -> Result<u8, Error> {
         )?)
     };
 
-    let network = match config.network {
+    // Bridging needs root on the host, so rootless defaults to loopback only.
+    let default_network = if rootless {
+        NetworkMode::None
+    } else {
+        NetworkMode::Bridge
+    };
+    let network = match config.network.as_ref().unwrap_or(&default_network) {
         NetworkMode::Bridge => Some(Network::setup_host(&config.hostname)?),
         NetworkMode::None => None,
     };
@@ -147,6 +174,12 @@ pub fn run(config: &Config) -> Result<u8, Error> {
         | CloneFlags::CLONE_NEWUTS
         | CloneFlags::CLONE_NEWNS
         | CloneFlags::CLONE_NEWNET;
+    // The kernel creates the user namespace first, then the others owned by it.
+    let flags = if rootless {
+        flags | CloneFlags::CLONE_NEWUSER
+    } else {
+        flags
+    };
 
     let mut stack = vec![0u8; STACK_SIZE];
     let child = Box::new(|| match init(&setup, &ready_rx, &ready_tx) {
@@ -164,7 +197,7 @@ pub fn run(config: &Config) -> Result<u8, Error> {
 
     drop(ready_rx);
 
-    if let Err(e) = release_child(cgroup.as_ref(), network.as_ref(), pid, ready_tx) {
+    if let Err(e) = release_child(id_map, cgroup.as_ref(), network.as_ref(), pid, ready_tx) {
         // The write end is gone, so the child sees EOF and exits.
         let _ = waitpid(pid, None);
         return Err(e);
@@ -199,11 +232,15 @@ struct ChildSetup<'a> {
 /// Takes `ready` by value: on error it's dropped unwritten, which the child
 /// reads as EOF and gives up.
 fn release_child(
+    id_map: Option<(Uid, Gid)>,
     cgroup: Option<&Cgroup>,
     network: Option<&Network>,
     pid: Pid,
     ready: OwnedFd,
 ) -> Result<(), Error> {
+    if let Some((uid, gid)) = id_map {
+        userns::write_id_maps(pid, uid, gid)?;
+    }
     if let Some(cgroup) = cgroup {
         cgroup.add(pid)?;
     }
@@ -259,6 +296,8 @@ fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<In
     network::configure(*addr)?;
 
     rootfs::enter(rootfs, files)?;
+
+    security::harden()?;
 
     // execvpe searches the caller's PATH, not the one in `env`, so set ours.
     // SAFETY: the cloned child is single-threaded, so nothing reads the

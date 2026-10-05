@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.190"
-nix = { version = "0.31.3", features = ["fs", "net", "sched", "mount", "process", "hostname", "signal"] }
+nix = { version = "0.31.3", features = ["fs", "net", "sched", "mount", "process", "hostname", "signal", "user"] }

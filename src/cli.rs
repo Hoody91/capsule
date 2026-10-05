@@ -52,10 +52,9 @@ impl Limits {
 }
 
 /// How the container's network namespace is connected.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum NetworkMode {
     /// A veth pair onto the host's capsule0 bridge, with outbound NAT.
-    #[default]
     Bridge,
     /// Loopback only. Needs no host privileges.
     None,
@@ -66,7 +65,8 @@ pub struct Config {
     pub hostname: String,
     pub rootfs: PathBuf,
     pub limits: Limits,
-    pub network: NetworkMode,
+    /// `None` when not given: the default depends on whether we run as root.
+    pub network: Option<NetworkMode>,
     pub command: String,
     pub args: Vec<String>,
 }
@@ -82,7 +82,7 @@ impl Config {
         let mut hostname = String::from(PROC_HOSTNAME);
         let mut rootfs = None;
         let mut limits = Limits::default();
-        let mut network = NetworkMode::default();
+        let mut network = None;
         let mut rest = Vec::new();
 
         while let Some(arg) = args.next() {
@@ -101,7 +101,7 @@ impl Config {
                     limits.cpus = Some(parse_flag(&mut args, "--cpus", parse_cpus)?)
                 }
                 "--network" if rest.is_empty() => {
-                    network = parse_flag(&mut args, "--network", parse_network)?
+                    network = Some(parse_flag(&mut args, "--network", parse_network)?)
                 }
                 _ => {
                     rest.push(arg);
@@ -380,16 +380,16 @@ mod tests {
     }
 
     #[test]
-    fn network_defaults_to_bridge() {
+    fn network_defaults_to_unset() {
         let config = parse(&["run", "--rootfs", "r", "sh"]).unwrap();
-        assert_eq!(config.network, NetworkMode::Bridge);
+        assert_eq!(config.network, None);
     }
 
     #[test]
     fn network_flag_sets_mode() {
         for (value, mode) in [("bridge", NetworkMode::Bridge), ("none", NetworkMode::None)] {
             let config = parse(&["run", "--rootfs", "r", "--network", value, "sh"]).unwrap();
-            assert_eq!(config.network, mode);
+            assert_eq!(config.network, Some(mode));
         }
     }
 

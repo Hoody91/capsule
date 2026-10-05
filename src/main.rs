@@ -8,6 +8,8 @@ mod container;
 mod netlink;
 mod network;
 mod rootfs;
+mod security;
+mod userns;
 
 fn main() -> ExitCode {
     match Config::new(std::env::args().skip(1)) {
