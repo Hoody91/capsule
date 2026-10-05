@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>capsule demo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>Served by nginx inside capsule</h1>
+    <p>This page comes from an nginx process running in a container started by
+      <code>capsule</code>: its own PID, mount, UTS and network namespaces, a
+      pivoted Alpine root, dropped capabilities and a seccomp filter.</p>
+    <p>If this page is styled, a second file (<code>/style.css</code>) was
+      served too, with the right content type.</p>
+  </main>
+</body>
+</html>
