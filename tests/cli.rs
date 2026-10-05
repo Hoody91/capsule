@@ -46,3 +46,10 @@ fn invalid_memory_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("invalid value 'lots' for --memory"));
 }
+
+#[test]
+fn invalid_network_exits_2() {
+    let output = capsule(&["run", "--rootfs", "r", "--network", "host", "sh"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("invalid value 'host' for --network"));
+}

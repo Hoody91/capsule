@@ -5,14 +5,23 @@ A minimal container runtime in Rust, built to understand the Linux primitives un
 ## Usage
 
 ```sh
-make rootfs            # download and extract an Alpine minirootfs into ./rootfs
+sudo apt install nftables   # for the container's outbound NAT
+make rootfs                 # download and extract an Alpine minirootfs into ./rootfs
 cargo build --release
 sudo ./target/release/capsule run --rootfs ./rootfs --hostname box1 sh
 ```
 
-Inside, you're in Alpine: `cat /etc/alpine-release` prints its version, `hostname` prints `box1`, `echo $$` prints `1`, and `ps` shows only the container's processes. The host's filesystem is not reachable.
+Inside, you're in Alpine: `cat /etc/alpine-release` prints its version, `hostname` prints `box1`, `echo $$` prints `1`, and `ps` shows only the container's processes. The host's filesystem is not reachable. `ip addr` shows an `eth0` on `10.200.0.0/24`, and the internet is reachable through NAT.
 
-Without root, `unshare -Urmn ./target/release/capsule run --rootfs ./rootfs sh` works too. The `-n` matters: mounting sysfs requires owning the network namespace.
+### Networking
+
+By default (`--network bridge`), each container gets its own network namespace connected to the host's `capsule0` bridge, with outbound NAT. `--network none` gives an isolated namespace with only loopback. That mode needs no host privileges, so it also works rootless:
+
+```sh
+unshare -Urm ./target/release/capsule run --rootfs ./rootfs --network none sh
+```
+
+The bridge, the NAT table and `net.ipv4.ip_forward=1` stay in place between runs, like Docker's `docker0`. `make net-clean` removes the bridge and the NAT table.
 
 ### Resource limits
 
@@ -34,13 +43,13 @@ kernelCommandLine = cgroup_no_v1=all
 - [x] **1. Process isolation** — PID, UTS and mount namespaces via `clone(2)`; private mount propagation; fresh `/proc`.
 - [x] **2. Filesystem isolation** — `pivot_root` into an extracted Alpine rootfs; mount `/proc`, `/sys`, `/dev`; unmount the old root.
 - [x] **3. Resource limits** — cgroups v2: `memory.max`, `pids.max`, `cpu.max`; clean up the cgroup on exit.
-- [ ] **4. Networking** — network namespace, veth pair, bridge, NAT to the outside.
+- [x] **4. Networking** — network namespace, veth pair, bridge, NAT to the outside.
 - [ ] **5. Hardening** — drop capabilities, seccomp filter, `no_new_privs`, user namespaces for rootless mode.
 - [ ] **6. Images** — pull and unpack an OCI image from a registry.
 
 ## How it works
 
-`capsule` calls `clone(2)` with `CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS`. The child becomes PID 1 in a new PID namespace, marks `/` as `MS_PRIVATE` so its mounts never leak to the host, sets its hostname, sets up the container's filesystem, then execs the requested command with a clean environment. The parent waits and passes the exit code through (`128 + signal` if killed).
+`capsule` calls `clone(2)` with `CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWNET`. The child becomes PID 1 in a new PID namespace, marks `/` as `MS_PRIVATE` so its mounts never leak to the host, sets its hostname, sets up the container's filesystem, then execs the requested command with a clean environment. The parent waits and passes the exit code through (`128 + signal` if killed).
 
 The filesystem is set up before the root is switched, while the host's `/dev` is still reachable. The rootfs is bind-mounted onto itself, because `pivot_root(2)` needs the new root to be a mount point. Then the child mounts:
 
@@ -53,3 +62,13 @@ Finally it calls `pivot_root(".", ".")` from inside the rootfs. That stacks the 
 When limits are given, the parent creates `/sys/fs/cgroup/capsule/<pid>` before cloning and writes `memory.max` (plus `memory.swap.max = 0`, so the limit leads to an OOM kill instead of swapping), `pids.max` and `cpu.max`. Each controller is first enabled in the parent's `cgroup.subtree_control`. The `capsule` level never holds processes itself, so cgroup v2's "no internal processes" rule holds.
 
 The child must be inside the cgroup before it execs. The parent can only learn the child's PID once `clone` returns, so the child starts by blocking on a pipe. The parent writes the PID to `cgroup.procs` and then sends one byte to release it. If anything fails, the parent closes the pipe instead, and the child sees EOF and exits. When the container exits, the parent writes `cgroup.kill` to catch any stragglers and removes the cgroup directory. If the OOM killer ran, capsule says so on stderr.
+
+Networking uses hand-built rtnetlink messages (`src/netlink.rs`), the same requests `ip link`/`ip addr`/`ip route` send. Before cloning, the parent:
+
+- creates the `capsule0` bridge with address `10.200.0.1/24`
+- turns on IP forwarding
+- loads an idempotent nftables ruleset that masquerades `10.200.0.0/24` traffic leaving the host
+- leases an address by atomically creating `/run/capsule/ips/<addr>` holding its PID; leases whose PID is gone are reclaimed
+- writes a `resolv.conf` (the host's nameservers minus loopback ones) and a `hosts` file, which the child bind-mounts read-only over the rootfs's
+
+After `clone`, while the child is still blocked on the pipe, the parent creates a veth pair. The `eth0` end is created directly inside the child's namespace (`IFLA_NET_NS_PID`), and the host end `vcap<pid>` is attached to the bridge. Once released, the child brings up `lo` and `eth0`, assigns its address, and adds a default route via the bridge. When the container exits, its namespace is destroyed, and the kernel deletes the veth pair with it.

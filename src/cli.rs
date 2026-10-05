@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: capsule run --rootfs DIR [--hostname NAME] [--memory SIZE] [--pids N] [--cpus N] <command> [args...]";
+pub const USAGE: &str = "usage: capsule run --rootfs DIR [--hostname NAME] [--memory SIZE] [--pids N] [--cpus N] [--network bridge|none] <command> [args...]";
 
 const PROC_HOSTNAME: &str = "capsule";
 
@@ -51,11 +51,22 @@ impl Limits {
     }
 }
 
+/// How the container's network namespace is connected.
+#[derive(Debug, Default, PartialEq)]
+pub enum NetworkMode {
+    /// A veth pair onto the host's capsule0 bridge, with outbound NAT.
+    #[default]
+    Bridge,
+    /// Loopback only. Needs no host privileges.
+    None,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub hostname: String,
     pub rootfs: PathBuf,
     pub limits: Limits,
+    pub network: NetworkMode,
     pub command: String,
     pub args: Vec<String>,
 }
@@ -71,6 +82,7 @@ impl Config {
         let mut hostname = String::from(PROC_HOSTNAME);
         let mut rootfs = None;
         let mut limits = Limits::default();
+        let mut network = NetworkMode::default();
         let mut rest = Vec::new();
 
         while let Some(arg) = args.next() {
@@ -87,6 +99,9 @@ impl Config {
                 }
                 "--cpus" if rest.is_empty() => {
                     limits.cpus = Some(parse_flag(&mut args, "--cpus", parse_cpus)?)
+                }
+                "--network" if rest.is_empty() => {
+                    network = parse_flag(&mut args, "--network", parse_network)?
                 }
                 _ => {
                     rest.push(arg);
@@ -107,6 +122,7 @@ impl Config {
             hostname,
             rootfs,
             limits,
+            network,
             command,
             args: rest.collect(),
         })
@@ -154,6 +170,14 @@ fn parse_cpus(s: &str) -> Option<f64> {
     s.parse()
         .ok()
         .filter(|&n: &f64| n.is_finite() && n >= MIN_CPUS)
+}
+
+fn parse_network(s: &str) -> Option<NetworkMode> {
+    match s {
+        "bridge" => Some(NetworkMode::Bridge),
+        "none" => Some(NetworkMode::None),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +377,39 @@ mod tests {
                 "{flag} {value}"
             );
         }
+    }
+
+    #[test]
+    fn network_defaults_to_bridge() {
+        let config = parse(&["run", "--rootfs", "r", "sh"]).unwrap();
+        assert_eq!(config.network, NetworkMode::Bridge);
+    }
+
+    #[test]
+    fn network_flag_sets_mode() {
+        for (value, mode) in [("bridge", NetworkMode::Bridge), ("none", NetworkMode::None)] {
+            let config = parse(&["run", "--rootfs", "r", "--network", value, "sh"]).unwrap();
+            assert_eq!(config.network, mode);
+        }
+    }
+
+    #[test]
+    fn invalid_network() {
+        assert_eq!(
+            parse_err(&["run", "--rootfs", "r", "--network", "host", "sh"]),
+            CliError::InvalidValue {
+                flag: "--network",
+                value: "host".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn network_without_value() {
+        assert_eq!(
+            parse_err(&["run", "--network"]),
+            CliError::MissingValue("--network")
+        );
     }
 
     #[test]

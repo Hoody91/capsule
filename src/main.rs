@@ -5,6 +5,8 @@ use crate::cli::Config;
 mod cgroup;
 mod cli;
 mod container;
+mod netlink;
+mod network;
 mod rootfs;
 
 fn main() -> ExitCode {

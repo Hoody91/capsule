@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::ffi::{CString, NulError};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
@@ -13,7 +14,8 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{Pid, close, execvpe, pipe2, read, sethostname, write};
 
 use crate::cgroup::Cgroup;
-use crate::cli::Config;
+use crate::cli::{Config, NetworkMode};
+use crate::network::{self, Network};
 use crate::rootfs;
 
 const STACK_SIZE: usize = 1024 * 1024;
@@ -30,6 +32,10 @@ pub enum Error {
     Cgroup { path: PathBuf, source: io::Error },
     Pipe(Errno),
     ParentAborted,
+    Netlink { op: &'static str, source: Errno },
+    Nft(String),
+    NoFreeAddress,
+    Network { path: PathBuf, source: io::Error },
     Clone(Errno),
     Wait(Errno),
     UnexpectedWaitStatus(WaitStatus),
@@ -53,6 +59,19 @@ impl fmt::Display for Error {
             Error::Cgroup { path, source } => write!(f, "cgroup {}: {source}", path.display()),
             Error::Pipe(e) => write!(f, "sync pipe: {e}"),
             Error::ParentAborted => write!(f, "parent aborted container setup"),
+            Error::Netlink {
+                op,
+                source: Errno::EPERM,
+            } => write!(
+                f,
+                "{op}: EPERM (network setup needs root; use --network none)"
+            ),
+            Error::Netlink { op, source } => write!(f, "{op}: {source}"),
+            Error::Nft(reason) => write!(f, "nft: {reason}"),
+            Error::NoFreeAddress => write!(f, "no free container address in 10.200.0.0/24"),
+            Error::Network { path, source } => {
+                write!(f, "network setup {}: {source}", path.display())
+            }
             Error::Clone(e) => write!(f, "clone failed (are you root?): {e}"),
             Error::Wait(e) => write!(f, "waitpid failed: {e}"),
             Error::UnexpectedWaitStatus(status) => write!(f, "unexpected wait status: {status:?}"),
@@ -103,23 +122,40 @@ pub fn run(config: &Config) -> Result<u8, Error> {
         )?)
     };
 
+    let network = match config.network {
+        NetworkMode::Bridge => Some(Network::setup_host(&config.hostname)?),
+        NetworkMode::None => None,
+    };
+    let setup = ChildSetup {
+        config,
+        rootfs: &rootfs,
+        argv: &argv,
+        env: &env,
+        addr: network.as_ref().map(|n| n.addr),
+        files: network
+            .as_ref()
+            .map(Network::bind_mounts)
+            .unwrap_or_default(),
+    };
+
     // The child blocks reading this until the parent has finished its side of
-    // the setup (e.g. moved it into the cgroup), so the command never runs
+    // the setup (moved it into the cgroup, given it a veth), so the command never runs
     // unconfined. CLOEXEC keeps both ends out of the command.
     let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).map_err(Error::Pipe)?;
 
-    let flags = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNS;
+    let flags = CloneFlags::CLONE_NEWPID
+        | CloneFlags::CLONE_NEWUTS
+        | CloneFlags::CLONE_NEWNS
+        | CloneFlags::CLONE_NEWNET;
 
     let mut stack = vec![0u8; STACK_SIZE];
-    let child = Box::new(
-        || match init(config, &rootfs, &argv, &env, &ready_rx, &ready_tx) {
-            Ok(never) => match never {},
-            Err(e) => {
-                eprintln!("capsule (child): {e}");
-                126
-            }
-        },
-    );
+    let child = Box::new(|| match init(&setup, &ready_rx, &ready_tx) {
+        Ok(never) => match never {},
+        Err(e) => {
+            eprintln!("capsule (child): {e}");
+            126
+        }
+    });
 
     // SAFETY: the child only runs `init`, which execs or returns an exit code.
     // SIGCHLD lets the parent reap it with waitpid.
@@ -128,7 +164,7 @@ pub fn run(config: &Config) -> Result<u8, Error> {
 
     drop(ready_rx);
 
-    if let Err(e) = release_child(cgroup.as_ref(), pid, ready_tx) {
+    if let Err(e) = release_child(cgroup.as_ref(), network.as_ref(), pid, ready_tx) {
         // The write end is gone, so the child sees EOF and exits.
         let _ = waitpid(pid, None);
         return Err(e);
@@ -146,13 +182,33 @@ pub fn run(config: &Config) -> Result<u8, Error> {
     Ok(code)
 }
 
+/// Everything the child needs, prepared by the parent before `clone`.
+struct ChildSetup<'a> {
+    config: &'a Config,
+    rootfs: &'a Path,
+    argv: &'a [CString],
+    env: &'a [CString],
+    /// The container's address when bridged.
+    addr: Option<Ipv4Addr>,
+    /// Host files to bind over the rootfs's, as (host, container).
+    files: Vec<(PathBuf, &'static str)>,
+}
+
 /// Finish the parent's side of the setup, then let the child go on to exec.
 ///
 /// Takes `ready` by value: on error it's dropped unwritten, which the child
 /// reads as EOF and gives up.
-fn release_child(cgroup: Option<&Cgroup>, pid: Pid, ready: OwnedFd) -> Result<(), Error> {
+fn release_child(
+    cgroup: Option<&Cgroup>,
+    network: Option<&Network>,
+    pid: Pid,
+    ready: OwnedFd,
+) -> Result<(), Error> {
     if let Some(cgroup) = cgroup {
         cgroup.add(pid)?;
+    }
+    if let Some(network) = network {
+        network.attach(pid)?;
     }
     write(&ready, &[1]).map_err(Error::Pipe)?;
     Ok(())
@@ -176,14 +232,16 @@ fn wait_for_parent(ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<(), Error> 
 }
 
 /// Runs inside the new namespaces as PID 1, then replaces itself with the command.
-fn init(
-    config: &Config,
-    rootfs: &Path,
-    argv: &[CString],
-    env: &[CString],
-    ready_rx: &OwnedFd,
-    ready_tx: &OwnedFd,
-) -> Result<Infallible, Error> {
+fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<Infallible, Error> {
+    let ChildSetup {
+        config,
+        rootfs,
+        argv,
+        env,
+        addr,
+        files,
+    } = setup;
+
     wait_for_parent(ready_rx, ready_tx)?;
 
     // Stop our mount changes propagating back to the host's mount namespace.
@@ -198,7 +256,9 @@ fn init(
 
     sethostname(&config.hostname).map_err(Error::SetHostname)?;
 
-    rootfs::enter(rootfs)?;
+    network::configure(*addr)?;
+
+    rootfs::enter(rootfs, files)?;
 
     // execvpe searches the caller's PATH, not the one in `env`, so set ours.
     // SAFETY: the cloned child is single-threaded, so nothing reads the

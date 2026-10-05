@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nix::NixPath;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
@@ -24,7 +24,7 @@ const DEV_SYMLINKS: &[(&str, &str)] = &[
 ///
 /// Must run inside a private mount namespace. Everything is mounted before the
 /// pivot, while the host's `/dev` is still reachable for the device binds.
-pub fn enter(rootfs: &Path) -> Result<(), Error> {
+pub fn enter(rootfs: &Path, files: &[(PathBuf, &str)]) -> Result<(), Error> {
     // pivot_root needs the new root to be a mount point.
     mount_at(
         Some(rootfs),
@@ -52,6 +52,7 @@ pub fn enter(rootfs: &Path) -> Result<(), Error> {
     )?;
 
     setup_dev(&rootfs.join("dev"))?;
+    bind_files(rootfs, files)?;
 
     pivot(rootfs)
 }
@@ -108,6 +109,37 @@ fn setup_dev(dev: &Path) -> Result<(), Error> {
         symlink(target, &path).map_err(|source| Error::Prepare { path, source })?;
     }
 
+    Ok(())
+}
+
+/// Bind each host file read-only over its path in the rootfs, e.g. a generated
+/// resolv.conf over `/etc/resolv.conf`.
+fn bind_files(rootfs: &Path, files: &[(PathBuf, &str)]) -> Result<(), Error> {
+    for (source, dest) in files {
+        let target = rootfs.join(dest.trim_start_matches('/'));
+        // A bind mount needs something to mount over.
+        if !target.exists() {
+            File::create(&target).map_err(|source| Error::Prepare {
+                path: target.clone(),
+                source,
+            })?;
+        }
+        mount_at(
+            Some(source.as_path()),
+            &target,
+            None,
+            MsFlags::MS_BIND,
+            None,
+        )?;
+        // MS_RDONLY is ignored on the initial bind; it takes a remount.
+        mount_at(
+            None::<&str>,
+            &target,
+            None,
+            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+            None,
+        )?;
+    }
     Ok(())
 }
 
