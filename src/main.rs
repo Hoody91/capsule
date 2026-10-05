@@ -3,12 +3,17 @@ use std::process::ExitCode;
 use crate::cli::Config;
 
 mod cli;
+mod container;
 
 fn main() -> ExitCode {
     match Config::new(std::env::args().skip(1)) {
-        Ok(_config) => {
-            unimplemented!()
-        }
+        Ok(config) => match container::run(&config) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("capsule: {e:#}");
+                ExitCode::from(125)
+            }
+        },
         Err(e) => {
             eprintln!("capsule {e}\n\n{}", cli::USAGE);
             ExitCode::from(2)
