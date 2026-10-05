@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use crate::cli::Config;
 
+mod cgroup;
 mod cli;
 mod container;
 mod rootfs;

@@ -1,15 +1,18 @@
 use std::convert::Infallible;
 use std::ffi::{CString, NulError};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
 use nix::errno::Errno;
+use nix::fcntl::OFlag;
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, clone};
 use nix::sys::signal::Signal;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{execvpe, sethostname};
+use nix::unistd::{Pid, close, execvpe, pipe2, read, sethostname, write};
 
+use crate::cgroup::Cgroup;
 use crate::cli::Config;
 use crate::rootfs;
 
@@ -23,6 +26,10 @@ pub enum Error {
     NulInCommand(NulError),
     Rootfs { path: PathBuf, source: io::Error },
     RootfsNotDir(PathBuf),
+    CgroupUnavailable(String),
+    Cgroup { path: PathBuf, source: io::Error },
+    Pipe(Errno),
+    ParentAborted,
     Clone(Errno),
     Wait(Errno),
     UnexpectedWaitStatus(WaitStatus),
@@ -42,6 +49,10 @@ impl fmt::Display for Error {
             Error::NulInCommand(e) => write!(f, "command contains a NUL byte: {e}"),
             Error::Rootfs { path, source } => write!(f, "rootfs {}: {source}", path.display()),
             Error::RootfsNotDir(path) => write!(f, "rootfs {} is not a directory", path.display()),
+            Error::CgroupUnavailable(reason) => write!(f, "cgroups unavailable: {reason}"),
+            Error::Cgroup { path, source } => write!(f, "cgroup {}: {source}", path.display()),
+            Error::Pipe(e) => write!(f, "sync pipe: {e}"),
+            Error::ParentAborted => write!(f, "parent aborted container setup"),
             Error::Clone(e) => write!(f, "clone failed (are you root?): {e}"),
             Error::Wait(e) => write!(f, "waitpid failed: {e}"),
             Error::UnexpectedWaitStatus(status) => write!(f, "unexpected wait status: {status:?}"),
@@ -82,26 +93,85 @@ pub fn run(config: &Config) -> Result<u8, Error> {
         return Err(Error::RootfsNotDir(rootfs));
     }
 
+    // Created before the child exists, so a bad host setup fails cheaply.
+    let cgroup = if config.limits.is_empty() {
+        None
+    } else {
+        Some(Cgroup::create(
+            &std::process::id().to_string(),
+            &config.limits,
+        )?)
+    };
+
+    // The child blocks reading this until the parent has finished its side of
+    // the setup (e.g. moved it into the cgroup), so the command never runs
+    // unconfined. CLOEXEC keeps both ends out of the command.
+    let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).map_err(Error::Pipe)?;
+
     let flags = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWNS;
 
     let mut stack = vec![0u8; STACK_SIZE];
-    let child = Box::new(|| match init(config, &rootfs, &argv, &env) {
-        Ok(never) => match never {},
-        Err(e) => {
-            eprintln!("capsule (child): {e}");
-            126
-        }
-    });
+    let child = Box::new(
+        || match init(config, &rootfs, &argv, &env, &ready_rx, &ready_tx) {
+            Ok(never) => match never {},
+            Err(e) => {
+                eprintln!("capsule (child): {e}");
+                126
+            }
+        },
+    );
 
     // SAFETY: the child only runs `init`, which execs or returns an exit code.
     // SIGCHLD lets the parent reap it with waitpid.
     let pid = unsafe { clone(child, &mut stack, flags, Some(Signal::SIGCHLD as i32)) }
         .map_err(Error::Clone)?;
 
-    match waitpid(pid, None).map_err(Error::Wait)? {
-        WaitStatus::Exited(_, code) => Ok(code as u8),
-        WaitStatus::Signaled(_, sig, _) => Ok(128 + sig as u8),
-        other => Err(Error::UnexpectedWaitStatus(other)),
+    drop(ready_rx);
+
+    if let Err(e) = release_child(cgroup.as_ref(), pid, ready_tx) {
+        // The write end is gone, so the child sees EOF and exits.
+        let _ = waitpid(pid, None);
+        return Err(e);
+    }
+
+    let code = match waitpid(pid, None).map_err(Error::Wait)? {
+        WaitStatus::Exited(_, code) => code as u8,
+        WaitStatus::Signaled(_, sig, _) => 128 + sig as u8,
+        other => return Err(Error::UnexpectedWaitStatus(other)),
+    };
+
+    if let Some(limit) = cgroup.as_ref().and_then(Cgroup::oom_killed) {
+        eprintln!("capsule: OOM killer ran in the container (memory limit {limit} bytes)");
+    }
+    Ok(code)
+}
+
+/// Finish the parent's side of the setup, then let the child go on to exec.
+///
+/// Takes `ready` by value: on error it's dropped unwritten, which the child
+/// reads as EOF and gives up.
+fn release_child(cgroup: Option<&Cgroup>, pid: Pid, ready: OwnedFd) -> Result<(), Error> {
+    if let Some(cgroup) = cgroup {
+        cgroup.add(pid)?;
+    }
+    write(&ready, &[1]).map_err(Error::Pipe)?;
+    Ok(())
+}
+
+/// Block until the parent releases us with a byte on `ready_rx`.
+fn wait_for_parent(ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<(), Error> {
+    // Our copy of the write end would keep the pipe open forever if the parent
+    // died, so close it: then EOF reliably means the parent gave up.
+    close(ready_tx.as_raw_fd()).map_err(Error::Pipe)?;
+
+    let mut byte = [0u8];
+    loop {
+        match read(ready_rx, &mut byte) {
+            Ok(1) => return Ok(()),
+            Ok(_) => return Err(Error::ParentAborted),
+            Err(Errno::EINTR) => continue,
+            Err(e) => return Err(Error::Pipe(e)),
+        }
     }
 }
 
@@ -111,7 +181,11 @@ fn init(
     rootfs: &Path,
     argv: &[CString],
     env: &[CString],
+    ready_rx: &OwnedFd,
+    ready_tx: &OwnedFd,
 ) -> Result<Infallible, Error> {
+    wait_for_parent(ready_rx, ready_tx)?;
+
     // Stop our mount changes propagating back to the host's mount namespace.
     mount(
         None::<&str>,

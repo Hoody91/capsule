@@ -39,3 +39,10 @@ fn run_without_rootfs_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("missing --rootfs"));
 }
+
+#[test]
+fn invalid_memory_exits_2() {
+    let output = capsule(&["run", "--rootfs", "r", "--memory", "lots", "sh"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("invalid value 'lots' for --memory"));
+}
