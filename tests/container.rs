@@ -2,7 +2,9 @@
 //! rootless, so these need no sudo, only the Alpine rootfs from `make rootfs`.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 /// The rootfs to run in, or `None` (and a note) if it hasn't been fetched.
 fn rootfs() -> Option<PathBuf> {
@@ -126,4 +128,103 @@ fn writes_do_not_reach_the_rootfs() {
         rootfs.join("etc/alpine-release").exists(),
         "delete leaked into rootfs"
     );
+}
+
+/// Where a rootless capsule with this pid keeps its container layer.
+fn layer_dir(capsule_pid: u32) -> PathBuf {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/share"));
+    data.join("capsule/containers")
+        .join(capsule_pid.to_string())
+}
+
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn signals_are_forwarded_then_escalated_and_cleanup_runs() {
+    let Some(rootfs) = rootfs() else { return };
+    // Running as root would need the bridge, cgroup paths etc.; this test is
+    // about the rootless layer directory.
+    // SAFETY: geteuid has no failure mode.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: run as non-root");
+        return;
+    }
+
+    // sleep as PID 1 has no SIGTERM handler, so the forwarded signal is
+    // ignored and only the second one (escalated to SIGKILL) stops it.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .arg("run")
+        .arg("--rootfs")
+        .arg(&rootfs)
+        .args(["--network", "none", "sleep", "30"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let layer = layer_dir(child.id());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !layer.join("merged").exists() {
+        assert!(Instant::now() < deadline, "container never started");
+        sleep(Duration::from_millis(20));
+    }
+    sleep(Duration::from_millis(200));
+
+    send_signal(child.id(), "-TERM");
+    sleep(Duration::from_millis(200));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "first SIGTERM should only be forwarded"
+    );
+
+    send_signal(child.id(), "-TERM");
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(128 + 9));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("passing SIGTERM"), "stderr: {stderr}");
+    assert!(stderr.contains("killing the container"), "stderr: {stderr}");
+    assert!(!layer.exists(), "layer directory left behind");
+}
+
+#[test]
+fn leftovers_of_a_killed_capsule_are_swept_by_the_next_run() {
+    let Some(rootfs) = rootfs() else { return };
+    // SAFETY: geteuid has no failure mode.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: run as non-root");
+        return;
+    }
+
+    let mut killed = Command::new(env!("CARGO_BIN_EXE_capsule"))
+        .arg("run")
+        .arg("--rootfs")
+        .arg(&rootfs)
+        .args(["--network", "none", "sleep", "30"])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let layer = layer_dir(killed.id());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !layer.join("merged").exists() {
+        assert!(Instant::now() < deadline, "container never started");
+        sleep(Duration::from_millis(20));
+    }
+
+    // SIGKILL can't be caught, so capsule leaves its layer behind.
+    killed.kill().unwrap();
+    killed.wait().unwrap();
+    assert!(layer.exists());
+
+    // Any later capsule sweeps it (other tests' runs may get there first).
+    let output = run_sh(&rootfs, &[], "true");
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(!layer.exists(), "leftover layer not swept");
 }

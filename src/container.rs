@@ -7,14 +7,15 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
-use libc::{c_int, gid_t, pid_t, uid_t};
+use libc::{c_int, gid_t, pid_t, sigset_t, uid_t};
 
 use crate::cgroup::Cgroup;
 use crate::cli::{Config, NetworkMode};
 use crate::network::{self, Network};
 use crate::overlay::Overlay;
+use crate::signals::Signals;
 use crate::sys::{self, WaitStatus};
-use crate::{rootfs, security, userns};
+use crate::{rootfs, security, sweep, userns};
 
 const STACK_SIZE: usize = 1024 * 1024;
 
@@ -31,6 +32,7 @@ pub enum Error {
     CgroupUnavailable(String),
     Cgroup { path: PathBuf, source: io::Error },
     Pipe(io::Error),
+    Signals(io::Error),
     ParentAborted,
     Netlink { op: &'static str, source: io::Error },
     Nft(String),
@@ -69,6 +71,7 @@ impl fmt::Display for Error {
             Error::CgroupUnavailable(reason) => write!(f, "cgroups unavailable: {reason}"),
             Error::Cgroup { path, source } => write!(f, "cgroup {}: {source}", path.display()),
             Error::Pipe(e) => write!(f, "sync pipe: {e}"),
+            Error::Signals(e) => write!(f, "signal handling: {e}"),
             Error::ParentAborted => write!(f, "parent aborted container setup"),
             Error::Netlink { op, source } if source.raw_os_error() == Some(libc::EPERM) => {
                 write!(
@@ -134,6 +137,14 @@ pub fn run(config: &Config) -> Result<u8, Error> {
     // root inside it, so the other namespaces can be created unprivileged.
     let rootless = sys::geteuid() != 0;
 
+    // From here on, everything created is cleaned up when this function
+    // returns, so termination signals must not kill us. Declared first so it's
+    // dropped last, after that cleanup.
+    let signals = Signals::block()?;
+
+    // Clear up after earlier capsules that died without cleaning up.
+    sweep::sweep(rootless);
+
     // The rootfs stays read-only: the container writes to its own layer, which
     // is deleted when this function returns.
     let overlay = Overlay::create(&rootfs, rootless)?;
@@ -165,6 +176,7 @@ pub fn run(config: &Config) -> Result<u8, Error> {
     let setup = ChildSetup {
         config,
         overlay: &overlay,
+        signal_mask: signals.original_mask(),
         argv: &argv,
         env: &env,
         addr: network.as_ref().map(|n| n.addr),
@@ -207,7 +219,7 @@ pub fn run(config: &Config) -> Result<u8, Error> {
         return Err(e);
     }
 
-    let code = match sys::waitpid(pid).map_err(Error::Wait)? {
+    let code = match signals.supervise(pid)? {
         WaitStatus::Exited(code) => code as u8,
         WaitStatus::Signaled(sig) => 128 + sig as u8,
         WaitStatus::Other(status) => return Err(Error::UnexpectedWaitStatus(status)),
@@ -223,6 +235,8 @@ pub fn run(config: &Config) -> Result<u8, Error> {
 struct ChildSetup<'a> {
     config: &'a Config,
     overlay: &'a Overlay,
+    /// The signal mask from before the parent blocked its signals.
+    signal_mask: sigset_t,
     argv: &'a [CString],
     env: &'a [CString],
     /// The container's address when bridged.
@@ -276,11 +290,22 @@ fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<In
     let ChildSetup {
         config,
         overlay,
+        signal_mask,
         argv,
         env,
         addr,
         files,
     } = setup;
+
+    // If capsule dies, even by SIGKILL, the kernel kills the container with it,
+    // rather than leaving it running unsupervised on a layer the next sweep
+    // would delete. Set before waiting: if capsule died even earlier, the read
+    // below sees EOF.
+    sys::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0)
+        .map_err(Error::Signals)?;
+
+    // The parent's blocked signals were inherited, and would survive exec.
+    sys::sigmask(libc::SIG_SETMASK, signal_mask).map_err(Error::Signals)?;
 
     wait_for_parent(ready_rx, ready_tx)?;
 

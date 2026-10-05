@@ -18,7 +18,8 @@ const SUBNET: &str = "10.200.0.0/24";
 /// Name of the container's end of the veth pair, inside its namespace.
 const CONTAINER_IF: &str = "eth0";
 
-const RUN_DIR: &str = "/run/capsule";
+/// Per-container network state (`<pid>/`) and address leases (`ips/`).
+pub const RUN_DIR: &str = "/run/capsule";
 const HOST_RESOLV_CONF: &str = "/etc/resolv.conf";
 const FALLBACK_NAMESERVER: &str = "1.1.1.1";
 
@@ -195,14 +196,16 @@ fn try_lease(path: &Path) -> Result<bool, Error> {
 }
 
 fn lease_is_stale(path: &Path) -> bool {
-    match fs::read_to_string(path) {
-        Ok(pid) => match pid.trim().parse::<u32>() {
-            Ok(pid) => !Path::new(&format!("/proc/{pid}")).exists(),
-            // Still being written by its creator, or garbage; leave it.
-            Err(_) => false,
-        },
-        Err(_) => false,
+    match lease_owner(path) {
+        Some(pid) => !Path::new(&format!("/proc/{pid}")).exists(),
+        // Still being written by its creator, or garbage; leave it.
+        None => false,
     }
+}
+
+/// The pid of the capsule holding a lease, if the lease is readable.
+pub fn lease_owner(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// The host's resolv.conf, minus nameservers the container can't reach:

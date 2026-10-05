@@ -10,6 +10,8 @@ mod network;
 mod overlay;
 mod rootfs;
 mod security;
+mod signals;
+mod sweep;
 mod sys;
 mod userns;
 

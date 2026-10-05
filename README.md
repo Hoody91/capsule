@@ -90,3 +90,18 @@ The last step before exec is hardening (`src/security.rs`), in this order:
 Before the root switch, the rootfs is covered by an overlayfs mount. The rootfs is the read-only lower layer. Each container gets an upper layer for its writes and deletions, plus overlay's work directory, under `/var/lib/capsule/containers/<pid>` (as root) or `~/.local/share/capsule/containers/<pid>` (rootless, or `$XDG_DATA_HOME/capsule/...`). The parent deletes the directory when the container exits.
 
 The layers live on disk, not on a tmpfs, for a reason specific to rootless mode. A rootless overlay must keep its whiteouts and opaque-directory markers in `user.*` xattrs (the `userxattr` mount option), and tmpfs only supports those from kernel 6.6. The overlay is mounted inside the child's private mount namespace, so the host only ever sees an empty `merged` directory.
+
+### Signals
+
+capsule must outlive the container to clean up its cgroup, layer directory and network lease, so it blocks SIGINT, SIGTERM, SIGHUP and SIGQUIT before creating any of them. It reads them from a `signalfd` while it waits. The child restores the original signal mask before exec, since a blocked mask would survive into the command.
+
+- **The first signal is forwarded to the container's PID 1**, so a server like nginx can shut down cleanly.
+- **A second signal kills the container with SIGKILL.** That matters for programs with no handler: the kernel drops other signals sent to a namespace's PID 1 when it hasn't set a handler, but SIGKILL from outside always gets through.
+- **Ctrl-C and Ctrl-\ at the terminal aren't forwarded or counted.** The kernel already sends them to the container, which shares the terminal's process group, so an interactive shell can use Ctrl-C as usual. If the container ignores them, stop it with `kill <capsule pid>` (twice).
+
+`kill -9` on capsule, or a crash, can't be caught. Two things cover it:
+
+- **The container dies with capsule.** The child sets `PR_SET_PDEATHSIG` to SIGKILL, so the kernel kills the container instead of leaving it running unsupervised.
+- **The next run sweeps up the leftovers.** Each capsule holds an `flock` on its layer directory while it runs, and the kernel releases the lock however the process ends. At startup, capsule removes every layer directory whose lock it can take. As root, it also removes every cgroup, `/run/capsule/<pid>` directory and address lease whose pid has no locked layer. The layer is created before that other state and removed after it, so this never touches a running container. Each cleanup is reported on stderr.
+
+A lock rather than "is that pid running?" because pids get reused.

@@ -27,7 +27,18 @@ pub struct Cgroup {
     memory: Option<u64>,
 }
 
+/// The directory holding every container's cgroup.
+pub fn capsule_dir() -> PathBuf {
+    Path::new(CGROUP_ROOT).join(CAPSULE_DIR)
+}
+
 impl Cgroup {
+    /// Take charge of an existing cgroup, e.g. one a dead capsule left behind,
+    /// so dropping it cleans it up.
+    pub fn adopt(path: PathBuf) -> Cgroup {
+        Cgroup { path, memory: None }
+    }
+
     /// Create `/sys/fs/cgroup/capsule/<name>` and apply `limits` to it.
     pub fn create(name: &str, limits: &Limits) -> Result<Cgroup, Error> {
         let controllers = needed_controllers(limits);

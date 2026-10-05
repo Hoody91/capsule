@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
-use libc::{c_char, c_int, c_long, c_ulong, gid_t, pid_t, uid_t};
+use libc::{c_char, c_int, c_long, c_ulong, gid_t, pid_t, sigset_t, uid_t};
 
 /// How a waited-for child ended.
 #[derive(Debug, PartialEq)]
@@ -184,22 +184,105 @@ pub fn execvpe(file: &CStr, argv: &[CString], env: &[CString]) -> io::Error {
 
 /// `waitpid(2)` for one child, retrying if a signal interrupts the wait.
 pub fn waitpid(pid: pid_t) -> io::Result<WaitStatus> {
-    let mut status: c_int = 0;
     loop {
+        if let Some(status) = wait(pid, 0)? {
+            return Ok(status);
+        }
+    }
+}
+
+/// `waitpid(2)` with `WNOHANG`: `None` while the child is still running.
+pub fn try_waitpid(pid: pid_t) -> io::Result<Option<WaitStatus>> {
+    wait(pid, libc::WNOHANG)
+}
+
+fn wait(pid: pid_t, flags: c_int) -> io::Result<Option<WaitStatus>> {
+    let mut status: c_int = 0;
+    let reaped = loop {
         // SAFETY: `status` is valid for the kernel to write.
-        match cvt(unsafe { libc::waitpid(pid, &mut status, 0) }) {
-            Ok(_) => break,
+        match cvt(unsafe { libc::waitpid(pid, &mut status, flags) }) {
+            Ok(reaped) => break reaped,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
+    };
+    if reaped == 0 {
+        return Ok(None);
     }
-    Ok(if libc::WIFEXITED(status) {
+    Ok(Some(if libc::WIFEXITED(status) {
         WaitStatus::Exited(libc::WEXITSTATUS(status))
     } else if libc::WIFSIGNALED(status) {
         WaitStatus::Signaled(libc::WTERMSIG(status))
     } else {
         WaitStatus::Other(status)
-    })
+    }))
+}
+
+/// A signal set holding exactly `signals`.
+pub fn sigset(signals: &[c_int]) -> sigset_t {
+    // SAFETY: sigemptyset initialises the whole set before sigaddset uses it;
+    // both only fail for invalid signal numbers, which callers don't pass.
+    unsafe {
+        let mut set: sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for &signal in signals {
+            libc::sigaddset(&mut set, signal);
+        }
+        set
+    }
+}
+
+/// `pthread_sigmask(3)`, returning the previous mask. `how` is `SIG_BLOCK`,
+/// `SIG_UNBLOCK` or `SIG_SETMASK`.
+pub fn sigmask(how: c_int, set: &sigset_t) -> io::Result<sigset_t> {
+    // SAFETY: zeroed is a valid sigset_t for the old mask to be written into.
+    let mut old: sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the call. pthread_sigmask returns
+    // the error number itself rather than setting errno.
+    match unsafe { libc::pthread_sigmask(how, set, &mut old) } {
+        0 => Ok(old),
+        errno => Err(io::Error::from_raw_os_error(errno)),
+    }
+}
+
+/// `signalfd(2)`: a descriptor that reads, instead of delivers, the signals
+/// in `set`. They must also be blocked, or they're delivered as usual.
+pub fn signalfd(set: &sigset_t) -> io::Result<OwnedFd> {
+    // SAFETY: `set` is valid for the call; -1 asks for a new descriptor.
+    let fd = cvt(unsafe { libc::signalfd(-1, set, libc::SFD_CLOEXEC) })?;
+    // SAFETY: `fd` was just created and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Read the next signal from a `signalfd`, blocking until one is pending.
+pub fn read_signal(fd: &OwnedFd) -> io::Result<libc::signalfd_siginfo> {
+    // SAFETY: signalfd_siginfo is plain integers, for which all-zero is valid.
+    let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::signalfd_siginfo>();
+    loop {
+        // SAFETY: `info` is valid for writes of `size` bytes.
+        let ret = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                (&mut info as *mut libc::signalfd_siginfo).cast::<c_void>(),
+                size,
+            )
+        };
+        match cvt_size(ret) {
+            // signalfd only ever returns whole records.
+            Ok(n) if n == size => return Ok(info),
+            Ok(_) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `kill(2)`
+pub fn kill(pid: pid_t, signal: c_int) -> io::Result<()> {
+    // SAFETY: plain kill(2) call, no pointers.
+    cvt(unsafe { libc::kill(pid, signal) })?;
+    Ok(())
 }
 
 /// `clone(2)` running `cb` in the child on `stack`. The child exits with
@@ -273,6 +356,32 @@ mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::process::Command;
+
+    #[test]
+    fn signalfd_reads_blocked_signals() {
+        // Test threads share the process, so use a thread-directed signal
+        // (raise uses tgkill) on this thread only.
+        let set = sigset(&[libc::SIGUSR1]);
+        let old = sigmask(libc::SIG_BLOCK, &set).unwrap();
+        let fd = signalfd(&set).unwrap();
+        // SAFETY: raising a signal this thread has blocked just leaves it pending.
+        assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+        let info = read_signal(&fd).unwrap();
+        sigmask(libc::SIG_SETMASK, &old).unwrap();
+        assert_eq!(info.ssi_signo as c_int, libc::SIGUSR1);
+        assert_eq!(info.ssi_code, libc::SI_TKILL);
+    }
+
+    #[test]
+    fn try_waitpid_sees_running_then_exited() {
+        let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+        let pid = child.id() as pid_t;
+        assert_eq!(try_waitpid(pid).unwrap(), None);
+        kill(pid, libc::SIGTERM).unwrap();
+        assert_eq!(waitpid(pid).unwrap(), WaitStatus::Signaled(libc::SIGTERM));
+        // Already reaped by us; std's own wait would now fail, so check that.
+        assert!(child.try_wait().is_err());
+    }
 
     #[test]
     fn cstring_rejects_interior_nul() {
