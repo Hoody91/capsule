@@ -107,3 +107,23 @@ fn host_filesystem_is_not_visible() {
     let output = run_sh(&rootfs, &[], "cat /etc/alpine-release && ! ls /home/*/dev");
     assert!(output.status.success(), "stderr: {}", stderr(&output));
 }
+
+#[test]
+fn writes_do_not_reach_the_rootfs() {
+    let Some(rootfs) = rootfs() else { return };
+    let marker = format!("capsule-test-{}", std::process::id());
+    let output = run_sh(
+        &rootfs,
+        &[],
+        &format!("echo x > /etc/{marker} && rm /etc/alpine-release && cat /etc/{marker}"),
+    );
+    assert_eq!(stdout(&output).trim(), "x", "stderr: {}", stderr(&output));
+    assert!(
+        !rootfs.join("etc").join(&marker).exists(),
+        "write leaked into rootfs"
+    );
+    assert!(
+        rootfs.join("etc/alpine-release").exists(),
+        "delete leaked into rootfs"
+    );
+}

@@ -11,7 +11,7 @@ cargo build --release
 sudo ./target/release/capsule run --rootfs ./rootfs --hostname box1 sh
 ```
 
-Inside, you're in Alpine: `cat /etc/alpine-release` prints its version, `hostname` prints `box1`, `echo $$` prints `1`, and `ps` shows only the container's processes. The host's filesystem is not reachable. `ip addr` shows an `eth0` on `10.200.0.0/24`, and the internet is reachable through NAT.
+Inside, you're in Alpine: `cat /etc/alpine-release` prints its version, `hostname` prints `box1`, `echo $$` prints `1`, and `ps` shows only the container's processes. The host's filesystem is not reachable, and nothing the container writes or deletes reaches `./rootfs`: each container runs on its own throwaway copy-on-write layer. `ip addr` shows an `eth0` on `10.200.0.0/24`, and the internet is reachable through NAT.
 
 ### Rootless
 
@@ -86,3 +86,7 @@ The last step before exec is hardening (`src/security.rs`), in this order:
 1. **`no_new_privs`:** setuid binaries and file capabilities can no longer raise privileges, and an unprivileged process may install a seccomp filter.
 2. **Capabilities:** everything outside Docker's default set is dropped from the bounding set, the ambient set is cleared, and `capset(2)` sets effective, permitted and inheritable to the same set. `CapEff` reads `00000000a80425fb`, as in a Docker container.
 3. **Seccomp:** a classic BPF filter kills the process for a non-x86_64 arch or an x32-ABI syscall. It returns `EPERM` for a deny-list of syscalls that change the kernel or system (modules, kexec, reboot, clock), rearrange the container's view (`mount`, `pivot_root`, `unshare`, `setns`, the new mount API) or expose a large attack surface (`bpf`, `perf_event_open`, `userfaultfd`, `keyctl`, `ptrace`, `io_uring`). It goes last, so the steps above aren't filtered.
+
+Before the root switch, the rootfs is covered by an overlayfs mount. The rootfs is the read-only lower layer. Each container gets an upper layer for its writes and deletions, plus overlay's work directory, under `/var/lib/capsule/containers/<pid>` (as root) or `~/.local/share/capsule/containers/<pid>` (rootless, or `$XDG_DATA_HOME/capsule/...`). The parent deletes the directory when the container exits.
+
+The layers live on disk, not on a tmpfs, for a reason specific to rootless mode. A rootless overlay must keep its whiteouts and opaque-directory markers in `user.*` xattrs (the `userxattr` mount option), and tmpfs only supports those from kernel 6.6. The overlay is mounted inside the child's private mount namespace, so the host only ever sees an empty `merged` directory.

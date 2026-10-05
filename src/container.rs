@@ -12,6 +12,7 @@ use libc::{c_int, gid_t, pid_t, uid_t};
 use crate::cgroup::Cgroup;
 use crate::cli::{Config, NetworkMode};
 use crate::network::{self, Network};
+use crate::overlay::Overlay;
 use crate::sys::{self, WaitStatus};
 use crate::{rootfs, security, userns};
 
@@ -25,6 +26,8 @@ pub enum Error {
     NulInCommand(NulError),
     Rootfs { path: PathBuf, source: io::Error },
     RootfsNotDir(PathBuf),
+    Overlay { path: PathBuf, source: io::Error },
+    OverlayPath(PathBuf),
     CgroupUnavailable(String),
     Cgroup { path: PathBuf, source: io::Error },
     Pipe(io::Error),
@@ -55,6 +58,14 @@ impl fmt::Display for Error {
             Error::NulInCommand(e) => write!(f, "command contains a NUL byte: {e}"),
             Error::Rootfs { path, source } => write!(f, "rootfs {}: {source}", path.display()),
             Error::RootfsNotDir(path) => write!(f, "rootfs {} is not a directory", path.display()),
+            Error::Overlay { path, source } => {
+                write!(f, "container layer {}: {source}", path.display())
+            }
+            Error::OverlayPath(path) => write!(
+                f,
+                "{} contains ',', ':' or '\\', which overlayfs mount options can't carry",
+                path.display()
+            ),
             Error::CgroupUnavailable(reason) => write!(f, "cgroups unavailable: {reason}"),
             Error::Cgroup { path, source } => write!(f, "cgroup {}: {source}", path.display()),
             Error::Pipe(e) => write!(f, "sync pipe: {e}"),
@@ -122,6 +133,10 @@ pub fn run(config: &Config) -> Result<u8, Error> {
     // Without root, capsule makes its own user namespace and maps our ids to
     // root inside it, so the other namespaces can be created unprivileged.
     let rootless = sys::geteuid() != 0;
+
+    // The rootfs stays read-only: the container writes to its own layer, which
+    // is deleted when this function returns.
+    let overlay = Overlay::create(&rootfs, rootless)?;
     if rootless && !config.limits.is_empty() {
         return Err(Error::LimitsNeedRoot);
     }
@@ -149,7 +164,7 @@ pub fn run(config: &Config) -> Result<u8, Error> {
     };
     let setup = ChildSetup {
         config,
-        rootfs: &rootfs,
+        overlay: &overlay,
         argv: &argv,
         env: &env,
         addr: network.as_ref().map(|n| n.addr),
@@ -207,7 +222,7 @@ pub fn run(config: &Config) -> Result<u8, Error> {
 /// Everything the child needs, prepared by the parent before `clone`.
 struct ChildSetup<'a> {
     config: &'a Config,
-    rootfs: &'a Path,
+    overlay: &'a Overlay,
     argv: &'a [CString],
     env: &'a [CString],
     /// The container's address when bridged.
@@ -260,7 +275,7 @@ fn wait_for_parent(ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<(), Error> 
 fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<Infallible, Error> {
     let ChildSetup {
         config,
-        rootfs,
+        overlay,
         argv,
         env,
         addr,
@@ -283,7 +298,8 @@ fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<In
 
     network::configure(*addr)?;
 
-    rootfs::enter(rootfs, files)?;
+    let root = overlay.mount()?;
+    rootfs::enter(&root, files)?;
 
     security::harden()?;
 

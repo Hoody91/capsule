@@ -7,6 +7,7 @@ mod cli;
 mod container;
 mod netlink;
 mod network;
+mod overlay;
 mod rootfs;
 mod security;
 mod sys;
