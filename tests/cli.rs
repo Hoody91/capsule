@@ -32,3 +32,10 @@ fn run_without_command_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("missing command to run"));
 }
+
+#[test]
+fn run_without_rootfs_exits_2() {
+    let output = capsule(&["run", "sh"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("missing --rootfs"));
+}

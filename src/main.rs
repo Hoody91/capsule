@@ -4,6 +4,7 @@ use crate::cli::Config;
 
 mod cli;
 mod container;
+mod rootfs;
 
 fn main() -> ExitCode {
     match Config::new(std::env::args().skip(1)) {

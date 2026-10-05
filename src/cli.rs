@@ -1,6 +1,7 @@
 use std::fmt;
+use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: capsule run [--hostname NAME] <command> [args...]";
+pub const USAGE: &str = "usage: capsule run --rootfs DIR [--hostname NAME] <command> [args...]";
 
 const PROC_HOSTNAME: &str = "capsule";
 
@@ -9,6 +10,8 @@ pub enum CliError {
     MissingSubcommand,
     UnknownSubcommand(String),
     MissingHostnameValue,
+    MissingRootfs,
+    MissingRootfsValue,
     MissingCommand,
 }
 
@@ -18,6 +21,8 @@ impl fmt::Display for CliError {
             CliError::MissingSubcommand => write!(f, "missing subcommand"),
             CliError::UnknownSubcommand(name) => write!(f, "unknown subcommand '{name}'"),
             CliError::MissingHostnameValue => write!(f, "--hostname needs a value"),
+            CliError::MissingRootfs => write!(f, "missing --rootfs"),
+            CliError::MissingRootfsValue => write!(f, "--rootfs needs a value"),
             CliError::MissingCommand => write!(f, "missing command to run"),
         }
     }
@@ -28,6 +33,7 @@ impl std::error::Error for CliError {}
 #[derive(Debug)]
 pub struct Config {
     pub hostname: String,
+    pub rootfs: PathBuf,
     pub command: String,
     pub args: Vec<String>,
 }
@@ -41,6 +47,7 @@ impl Config {
         }
 
         let mut hostname = String::from(PROC_HOSTNAME);
+        let mut rootfs = None;
         let mut rest = Vec::new();
 
         while let Some(arg) = args.next() {
@@ -48,6 +55,10 @@ impl Config {
                 "--hostname" if rest.is_empty() => match args.next() {
                     Some(h) => hostname = h,
                     None => return Err(CliError::MissingHostnameValue),
+                },
+                "--rootfs" if rest.is_empty() => match args.next() {
+                    Some(r) => rootfs = Some(PathBuf::from(r)),
+                    None => return Err(CliError::MissingRootfsValue),
                 },
                 _ => {
                     rest.push(arg);
@@ -60,9 +71,13 @@ impl Config {
         let Some(command) = rest.next() else {
             return Err(CliError::MissingCommand);
         };
+        let Some(rootfs) = rootfs else {
+            return Err(CliError::MissingRootfs);
+        };
 
         Ok(Config {
             hostname,
+            rootfs,
             command,
             args: rest.collect(),
         })
@@ -83,7 +98,7 @@ mod tests {
 
     #[test]
     fn run_with_command_only() {
-        let config = parse(&["run", "sh"]).unwrap();
+        let config = parse(&["run", "--rootfs", "r", "sh"]).unwrap();
         assert_eq!(config.hostname, PROC_HOSTNAME);
         assert_eq!(config.command, "sh");
         assert!(config.args.is_empty());
@@ -91,27 +106,37 @@ mod tests {
 
     #[test]
     fn run_with_command_and_args() {
-        let config = parse(&["run", "echo", "hello", "world"]).unwrap();
+        let config = parse(&["run", "--rootfs", "r", "echo", "hello", "world"]).unwrap();
         assert_eq!(config.command, "echo");
         assert_eq!(config.args, ["hello", "world"]);
     }
 
     #[test]
     fn hostname_flag_sets_hostname() {
-        let config = parse(&["run", "--hostname", "box", "sh"]).unwrap();
+        let config = parse(&["run", "--rootfs", "r", "--hostname", "box", "sh"]).unwrap();
         assert_eq!(config.hostname, "box");
         assert_eq!(config.command, "sh");
     }
 
     #[test]
     fn last_hostname_flag_wins() {
-        let config = parse(&["run", "--hostname", "a", "--hostname", "b", "sh"]).unwrap();
+        let config = parse(&[
+            "run",
+            "--rootfs",
+            "r",
+            "--hostname",
+            "a",
+            "--hostname",
+            "b",
+            "sh",
+        ])
+        .unwrap();
         assert_eq!(config.hostname, "b");
     }
 
     #[test]
     fn flags_after_command_belong_to_command() {
-        let config = parse(&["run", "sh", "--hostname", "box"]).unwrap();
+        let config = parse(&["run", "--rootfs", "r", "sh", "--hostname", "box"]).unwrap();
         assert_eq!(config.hostname, PROC_HOSTNAME);
         assert_eq!(config.command, "sh");
         assert_eq!(config.args, ["--hostname", "box"]);
@@ -119,9 +144,43 @@ mod tests {
 
     #[test]
     fn unknown_flag_is_treated_as_command() {
-        let config = parse(&["run", "--verbose", "sh"]).unwrap();
+        let config = parse(&["run", "--rootfs", "r", "--verbose", "sh"]).unwrap();
         assert_eq!(config.command, "--verbose");
         assert_eq!(config.args, ["sh"]);
+    }
+
+    #[test]
+    fn rootfs_flag_sets_rootfs() {
+        let config = parse(&["run", "--hostname", "box", "--rootfs", "./alpine", "sh"]).unwrap();
+        assert_eq!(config.rootfs, PathBuf::from("./alpine"));
+        assert_eq!(config.hostname, "box");
+        assert_eq!(config.command, "sh");
+    }
+
+    #[test]
+    fn rootfs_after_command_belongs_to_command() {
+        assert_eq!(
+            parse_err(&["run", "sh", "--rootfs", "r"]),
+            CliError::MissingRootfs
+        );
+    }
+
+    #[test]
+    fn missing_rootfs() {
+        assert_eq!(parse_err(&["run", "sh"]), CliError::MissingRootfs);
+    }
+
+    #[test]
+    fn rootfs_without_value() {
+        assert_eq!(
+            parse_err(&["run", "--rootfs"]),
+            CliError::MissingRootfsValue
+        );
+    }
+
+    #[test]
+    fn missing_command_reported_before_missing_rootfs() {
+        assert_eq!(parse_err(&["run"]), CliError::MissingCommand);
     }
 
     #[test]
@@ -171,6 +230,11 @@ mod tests {
         assert_eq!(
             CliError::MissingHostnameValue.to_string(),
             "--hostname needs a value"
+        );
+        assert_eq!(CliError::MissingRootfs.to_string(), "missing --rootfs");
+        assert_eq!(
+            CliError::MissingRootfsValue.to_string(),
+            "--rootfs needs a value"
         );
         assert_eq!(
             CliError::MissingCommand.to_string(),
