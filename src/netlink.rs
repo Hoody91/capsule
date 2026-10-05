@@ -1,12 +1,14 @@
 //! A minimal rtnetlink client: just the requests capsule needs to wire up a
 //! container's network (what `ip link`, `ip addr` and `ip route` send).
 
+use std::io;
 use std::mem;
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
-use libc::{c_int, c_void};
-use nix::errno::Errno;
+use libc::c_int;
+
+use crate::sys;
 
 /// From `<linux/veth.h>`, which libc doesn't cover.
 const VETH_INFO_PEER: u16 = 1;
@@ -169,43 +171,35 @@ pub struct Netlink {
 }
 
 impl Netlink {
-    pub fn open() -> Result<Netlink, Errno> {
-        // SAFETY: plain socket(2) call; the result is checked before use.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_ROUTE,
-            )
-        };
-        if fd < 0 {
-            return Err(Errno::last());
-        }
-        // SAFETY: `fd` is a freshly created descriptor that nothing else owns.
-        // The kernel binds it to an address on first send, so no bind() needed.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    pub fn open() -> io::Result<Netlink> {
+        // The kernel binds the socket to an address on first send, so no bind().
+        let fd = sys::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )?;
         Ok(Netlink { fd, seq: 0 })
     }
 
     /// `ip link add NAME type bridge`
-    pub fn create_bridge(&mut self, name: &str) -> Result<(), Errno> {
+    pub fn create_bridge(&mut self, name: &str) -> io::Result<()> {
         self.request(bridge_message(name))
     }
 
     /// `ip link add NAME type veth peer name PEER netns PEER_PID`
-    pub fn create_veth(&mut self, name: &str, peer: &str, peer_pid: u32) -> Result<(), Errno> {
+    pub fn create_veth(&mut self, name: &str, peer: &str, peer_pid: u32) -> io::Result<()> {
         self.request(veth_message(name, peer, peer_pid))
     }
 
     /// `ip link set dev INDEX master MASTER`
-    pub fn set_master(&mut self, index: u32, master: u32) -> Result<(), Errno> {
+    pub fn set_master(&mut self, index: u32, master: u32) -> io::Result<()> {
         let mut msg = Message::new(libc::RTM_NEWLINK, 0, &ifinfomsg(index));
         msg.attr_u32(libc::IFLA_MASTER, master);
         self.request(msg)
     }
 
     /// `ip link set dev INDEX up`
-    pub fn set_up(&mut self, index: u32) -> Result<(), Errno> {
+    pub fn set_up(&mut self, index: u32) -> io::Result<()> {
         let mut info = ifinfomsg(index);
         info.ifi_flags = libc::IFF_UP as u32;
         info.ifi_change = libc::IFF_UP as u32;
@@ -213,7 +207,7 @@ impl Netlink {
     }
 
     /// `ip addr add ADDR/PREFIX dev INDEX`
-    pub fn add_addr(&mut self, index: u32, addr: Ipv4Addr, prefix: u8) -> Result<(), Errno> {
+    pub fn add_addr(&mut self, index: u32, addr: Ipv4Addr, prefix: u8) -> io::Result<()> {
         let header = libc::ifaddrmsg {
             ifa_family: libc::AF_INET as u8,
             ifa_prefixlen: prefix,
@@ -232,7 +226,7 @@ impl Netlink {
     }
 
     /// `ip route add default via GATEWAY`
-    pub fn add_default_route(&mut self, gateway: Ipv4Addr) -> Result<(), Errno> {
+    pub fn add_default_route(&mut self, gateway: Ipv4Addr) -> io::Result<()> {
         let header = RtMsg {
             family: libc::AF_INET as u8,
             dst_len: 0,
@@ -255,41 +249,20 @@ impl Netlink {
 
     /// Send one request and wait for the kernel's ack (an `NLMSG_ERROR` whose
     /// error is 0) or its errno.
-    fn request(&mut self, msg: Message) -> Result<(), Errno> {
+    fn request(&mut self, msg: Message) -> io::Result<()> {
         self.seq += 1;
         let buf = msg.finish(self.seq);
 
-        // SAFETY: `buf` is valid for `buf.len()` bytes for the whole call.
-        let sent = unsafe {
-            libc::send(
-                self.fd.as_raw_fd(),
-                buf.as_ptr().cast::<c_void>(),
-                buf.len(),
-                0,
-            )
-        };
-        if sent < 0 {
-            return Err(Errno::last());
-        }
+        sys::send(&self.fd, &buf)?;
 
         let mut reply = [0u8; 8192];
         loop {
-            // SAFETY: `reply` is valid for writes of `reply.len()` bytes.
-            let len = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    reply.as_mut_ptr().cast::<c_void>(),
-                    reply.len(),
-                    0,
-                )
+            let len = match sys::recv(&self.fd, &mut reply) {
+                Ok(len) => len,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
             };
-            if len < 0 {
-                match Errno::last() {
-                    Errno::EINTR => continue,
-                    e => return Err(e),
-                }
-            }
-            if let Some(result) = find_ack(&reply[..len as usize], self.seq) {
+            if let Some(result) = find_ack(&reply[..len], self.seq) {
                 return result;
             }
         }
@@ -297,14 +270,17 @@ impl Netlink {
 }
 
 /// Scan a datagram of netlink messages for the ack to request `seq`.
-fn find_ack(mut data: &[u8], seq: u32) -> Option<Result<(), Errno>> {
+fn find_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
     let u32_at = |d: &[u8], at: usize| u32::from_ne_bytes(d[at..at + 4].try_into().unwrap());
     let u16_at = |d: &[u8], at: usize| u16::from_ne_bytes(d[at..at + 2].try_into().unwrap());
 
     while data.len() >= NLMSG_HDRLEN {
         let len = u32_at(data, 0) as usize;
         if len < NLMSG_HDRLEN || len > data.len() {
-            return Some(Err(Errno::EBADMSG));
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed netlink reply",
+            )));
         }
         let kind = u16_at(data, 4) as c_int;
         if kind == libc::NLMSG_ERROR && u32_at(data, 8) == seq && len >= NLMSG_HDRLEN + 4 {
@@ -313,7 +289,7 @@ fn find_ack(mut data: &[u8], seq: u32) -> Option<Result<(), Errno>> {
                 i32::from_ne_bytes(data[NLMSG_HDRLEN..NLMSG_HDRLEN + 4].try_into().unwrap());
             return Some(match error {
                 0 => Ok(()),
-                e => Err(Errno::from_raw(-e)),
+                e => Err(io::Error::from_raw_os_error(-e)),
             });
         }
         data = &data[align(len).min(data.len())..];
@@ -413,16 +389,21 @@ mod tests {
         buf
     }
 
+    /// The errno of `find_ack`'s answer: Some(0) for an ack, None for no answer.
+    fn ack_errno(data: &[u8], seq: u32) -> Option<i32> {
+        find_ack(data, seq).map(|result| match result {
+            Ok(()) => 0,
+            Err(e) => e.raw_os_error().expect("an OS error"),
+        })
+    }
+
     #[test]
     fn find_ack_reads_errno() {
-        assert_eq!(find_ack(&ack(5, 0), 5), Some(Ok(())));
-        assert_eq!(
-            find_ack(&ack(5, -libc::EEXIST), 5),
-            Some(Err(Errno::EEXIST))
-        );
-        assert_eq!(find_ack(&ack(4, 0), 5), None, "other request's ack");
+        assert_eq!(ack_errno(&ack(5, 0), 5), Some(0));
+        assert_eq!(ack_errno(&ack(5, -libc::EEXIST), 5), Some(libc::EEXIST));
+        assert_eq!(ack_errno(&ack(4, 0), 5), None, "other request's ack");
         let mut two = ack(4, 0);
         two.extend(ack(5, -libc::EPERM));
-        assert_eq!(find_ack(&two, 5), Some(Err(Errno::EPERM)));
+        assert_eq!(ack_errno(&two, 5), Some(libc::EPERM));
     }
 }

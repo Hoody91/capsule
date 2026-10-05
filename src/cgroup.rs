@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 
-use nix::errno::Errno;
-use nix::unistd::Pid;
+use libc::pid_t;
 
 use crate::cli::Limits;
 use crate::container::Error;
@@ -68,7 +67,7 @@ impl Cgroup {
     }
 
     /// Move `pid` into this cgroup. Its future children are born inside it.
-    pub fn add(&self, pid: Pid) -> Result<(), Error> {
+    pub fn add(&self, pid: pid_t) -> Result<(), Error> {
         self.write("cgroup.procs", &pid.to_string())
     }
 
@@ -101,7 +100,7 @@ impl Drop for Cgroup {
         let mut result = fs::remove_dir(&self.path);
         for _ in 1..CLEANUP_ATTEMPTS {
             match &result {
-                Err(e) if e.raw_os_error() == Some(Errno::EBUSY as i32) => {
+                Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
                     sleep(CLEANUP_INTERVAL);
                     result = fs::remove_dir(&self.path);
                 }

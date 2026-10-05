@@ -5,9 +5,10 @@
 use std::mem;
 
 use libc::{c_int, c_ulong, sock_filter};
-use nix::errno::Errno;
+use std::io;
 
 use crate::container::Error;
+use crate::sys;
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("capsule's seccomp filter only knows x86_64's arch id and syscall numbers");
@@ -135,7 +136,7 @@ const DENIED_SYSCALLS: &[libc::c_long] = &[
 pub fn harden() -> Result<(), Error> {
     // setuid binaries and file capabilities can no longer grant privileges,
     // and it lets an unprivileged process install a seccomp filter.
-    prctl(libc::PR_SET_NO_NEW_PRIVS, 1, "setting no_new_privs")?;
+    sys::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0).map_err(security("setting no_new_privs"))?;
     drop_capabilities()?;
     install_seccomp()
 }
@@ -152,28 +153,20 @@ fn drop_capabilities() -> Result<(), Error> {
         if kept & (1 << cap) != 0 {
             continue;
         }
-        match prctl(libc::PR_CAPBSET_DROP, cap as c_ulong, "dropping capability") {
+        match sys::prctl(libc::PR_CAPBSET_DROP, cap as c_ulong, 0) {
             Ok(()) => {}
             // Past the kernel's last capability.
-            Err(Error::Security {
-                source: Errno::EINVAL,
-                ..
-            }) => break,
-            Err(e) => return Err(e),
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => break,
+            Err(e) => return Err(security("dropping capability")(e)),
         }
     }
 
-    // SAFETY: PR_CAP_AMBIENT_CLEAR_ALL takes no pointers.
-    let cleared = unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL as c_ulong,
-            0 as c_ulong,
-            0 as c_ulong,
-            0 as c_ulong,
-        )
-    };
-    check(cleared, "clearing ambient capabilities")?;
+    sys::prctl(
+        libc::PR_CAP_AMBIENT,
+        libc::PR_CAP_AMBIENT_CLEAR_ALL as c_ulong,
+        0,
+    )
+    .map_err(security("clearing ambient capabilities"))?;
 
     let header = CapHeader {
         version: LINUX_CAPABILITY_VERSION_3,
@@ -191,7 +184,8 @@ fn drop_capabilities() -> Result<(), Error> {
     // SAFETY: header and data are valid, correctly laid out for version 3,
     // and live for the duration of the call.
     let ret = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
-    check(ret as c_int, "setting capabilities")
+    sys::cvt_long(ret).map_err(security("setting capabilities"))?;
+    Ok(())
 }
 
 /// Classic BPF program run by the kernel on every syscall, over a
@@ -269,23 +263,12 @@ fn install_seccomp() -> Result<(), Error> {
             &fprog as *const libc::sock_fprog,
         )
     };
-    check(ret, "installing seccomp filter")
-}
-
-fn prctl(option: c_int, arg: c_ulong, op: &'static str) -> Result<(), Error> {
-    // SAFETY: the options used here take only integer arguments.
-    let ret = unsafe { libc::prctl(option, arg, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) };
-    check(ret, op)
-}
-
-fn check(ret: c_int, op: &'static str) -> Result<(), Error> {
-    if ret < 0 {
-        return Err(Error::Security {
-            op,
-            source: Errno::last(),
-        });
-    }
+    sys::cvt(ret).map_err(security("installing seccomp filter"))?;
     Ok(())
+}
+
+fn security(op: &'static str) -> impl Fn(io::Error) -> Error {
+    move |source| Error::Security { op, source }
 }
 
 #[cfg(test)]

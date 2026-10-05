@@ -2,11 +2,10 @@ use std::fs::{self, File};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use nix::NixPath;
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::unistd::{chdir, pivot_root};
+use libc::c_ulong;
 
 use crate::container::Error;
+use crate::sys;
 
 /// Host device nodes bind-mounted into the container's `/dev`.
 const DEVICES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty"];
@@ -30,24 +29,24 @@ pub fn enter(rootfs: &Path, files: &[(PathBuf, &str)]) -> Result<(), Error> {
         Some(rootfs),
         rootfs,
         None,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
+        libc::MS_BIND | libc::MS_REC,
         None,
     )?;
 
     // A fresh procfs reflects our PID namespace, so `ps` only sees this container.
     mount_at(
-        Some("proc"),
+        Some(Path::new("proc")),
         &rootfs.join("proc"),
         Some("proc"),
-        MsFlags::empty(),
+        0,
         None,
     )?;
 
     mount_at(
-        Some("sysfs"),
+        Some(Path::new("sysfs")),
         &rootfs.join("sys"),
         Some("sysfs"),
-        MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
     )?;
 
@@ -61,10 +60,10 @@ pub fn enter(rootfs: &Path, files: &[(PathBuf, &str)]) -> Result<(), Error> {
 fn setup_dev(dev: &Path) -> Result<(), Error> {
     // No MS_NODEV: the bind-mounted device nodes below must stay usable.
     mount_at(
-        Some("tmpfs"),
+        Some(Path::new("tmpfs")),
         dev,
         Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
+        libc::MS_NOSUID | libc::MS_STRICTATIME,
         Some("mode=755,size=65536k"),
     )?;
 
@@ -76,10 +75,10 @@ fn setup_dev(dev: &Path) -> Result<(), Error> {
             source,
         })?;
         mount_at(
-            Some(&Path::new("/dev").join(name)),
+            Some(Path::new("/dev").join(name).as_path()),
             &target,
             None,
-            MsFlags::MS_BIND,
+            libc::MS_BIND,
             None,
         )?;
     }
@@ -87,20 +86,20 @@ fn setup_dev(dev: &Path) -> Result<(), Error> {
     let pts = dev.join("pts");
     create_dir(&pts)?;
     mount_at(
-        Some("devpts"),
+        Some(Path::new("devpts")),
         &pts,
         Some("devpts"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        libc::MS_NOSUID | libc::MS_NOEXEC,
         Some("newinstance,ptmxmode=0666,mode=0620"),
     )?;
 
     let shm = dev.join("shm");
     create_dir(&shm)?;
     mount_at(
-        Some("shm"),
+        Some(Path::new("shm")),
         &shm,
         Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         Some("mode=1777,size=65536k"),
     )?;
 
@@ -124,19 +123,13 @@ fn bind_files(rootfs: &Path, files: &[(PathBuf, &str)]) -> Result<(), Error> {
                 source,
             })?;
         }
-        mount_at(
-            Some(source.as_path()),
-            &target,
-            None,
-            MsFlags::MS_BIND,
-            None,
-        )?;
+        mount_at(Some(source.as_path()), &target, None, libc::MS_BIND, None)?;
         // MS_RDONLY is ignored on the initial bind; it takes a remount.
         mount_at(
-            None::<&str>,
+            None,
             &target,
             None,
-            MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
             None,
         )?;
     }
@@ -145,17 +138,18 @@ fn bind_files(rootfs: &Path, files: &[(PathBuf, &str)]) -> Result<(), Error> {
 
 /// Swap `/` for `rootfs` and detach the old root so the host is unreachable.
 fn pivot(rootfs: &Path) -> Result<(), Error> {
-    chdir(rootfs).map_err(|source| Error::Chdir {
+    sys::chdir(rootfs).map_err(|source| Error::Chdir {
         path: rootfs.to_path_buf(),
         source,
     })?;
 
     // pivot_root(".", ".") stacks the old root on top of the new one at `/`,
     // so no put_old directory is needed; unmounting `.` then removes it.
-    pivot_root(".", ".").map_err(Error::PivotRoot)?;
-    umount2(".", MntFlags::MNT_DETACH).map_err(Error::UnmountOldRoot)?;
+    let here = Path::new(".");
+    sys::pivot_root(here, here).map_err(Error::PivotRoot)?;
+    sys::umount2(here, libc::MNT_DETACH).map_err(Error::UnmountOldRoot)?;
 
-    chdir("/").map_err(|source| Error::Chdir {
+    sys::chdir(Path::new("/")).map_err(|source| Error::Chdir {
         path: "/".into(),
         source,
     })
@@ -168,14 +162,14 @@ fn create_dir(path: &Path) -> Result<(), Error> {
     })
 }
 
-fn mount_at<S: ?Sized + NixPath>(
-    source: Option<&S>,
+fn mount_at(
+    source: Option<&Path>,
     target: &Path,
     fstype: Option<&str>,
-    flags: MsFlags,
+    flags: c_ulong,
     data: Option<&str>,
 ) -> Result<(), Error> {
-    mount(source, target, fstype, flags, data).map_err(|source| Error::Mount {
+    sys::mount(source, target, fstype, flags, data).map_err(|source| Error::Mount {
         target: target.to_path_buf(),
         source,
     })

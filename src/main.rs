@@ -9,6 +9,7 @@ mod netlink;
 mod network;
 mod rootfs;
 mod security;
+mod sys;
 mod userns;
 
 fn main() -> ExitCode {

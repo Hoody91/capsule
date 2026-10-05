@@ -1,23 +1,18 @@
 use std::convert::Infallible;
 use std::ffi::{CString, NulError};
+use std::fs::File;
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
-use nix::errno::Errno;
-use nix::fcntl::OFlag;
-use nix::mount::{MsFlags, mount};
-use nix::sched::{CloneFlags, clone};
-use nix::sys::signal::Signal;
-use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{
-    Gid, Pid, Uid, close, execvpe, getegid, geteuid, pipe2, read, sethostname, write,
-};
+use libc::{c_int, gid_t, pid_t, uid_t};
 
 use crate::cgroup::Cgroup;
 use crate::cli::{Config, NetworkMode};
 use crate::network::{self, Network};
+use crate::sys::{self, WaitStatus};
 use crate::{rootfs, security, userns};
 
 const STACK_SIZE: usize = 1024 * 1024;
@@ -32,26 +27,26 @@ pub enum Error {
     RootfsNotDir(PathBuf),
     CgroupUnavailable(String),
     Cgroup { path: PathBuf, source: io::Error },
-    Pipe(Errno),
+    Pipe(io::Error),
     ParentAborted,
-    Netlink { op: &'static str, source: Errno },
+    Netlink { op: &'static str, source: io::Error },
     Nft(String),
     NoFreeAddress,
     Network { path: PathBuf, source: io::Error },
     LimitsNeedRoot,
     UserNamespace { path: PathBuf, source: io::Error },
-    Security { op: &'static str, source: Errno },
-    Clone(Errno),
-    Wait(Errno),
-    UnexpectedWaitStatus(WaitStatus),
-    MakeRootPrivate(Errno),
-    SetHostname(Errno),
-    Mount { target: PathBuf, source: Errno },
+    Security { op: &'static str, source: io::Error },
+    Clone(io::Error),
+    Wait(io::Error),
+    UnexpectedWaitStatus(c_int),
+    MakeRootPrivate(io::Error),
+    SetHostname(io::Error),
+    Mount { target: PathBuf, source: io::Error },
     Prepare { path: PathBuf, source: io::Error },
-    Chdir { path: PathBuf, source: Errno },
-    PivotRoot(Errno),
-    UnmountOldRoot(Errno),
-    Exec { command: CString, source: Errno },
+    Chdir { path: PathBuf, source: io::Error },
+    PivotRoot(io::Error),
+    UnmountOldRoot(io::Error),
+    Exec { command: CString, source: io::Error },
 }
 
 impl fmt::Display for Error {
@@ -64,13 +59,12 @@ impl fmt::Display for Error {
             Error::Cgroup { path, source } => write!(f, "cgroup {}: {source}", path.display()),
             Error::Pipe(e) => write!(f, "sync pipe: {e}"),
             Error::ParentAborted => write!(f, "parent aborted container setup"),
-            Error::Netlink {
-                op,
-                source: Errno::EPERM,
-            } => write!(
-                f,
-                "{op}: EPERM (network setup needs root; use --network none)"
-            ),
+            Error::Netlink { op, source } if source.raw_os_error() == Some(libc::EPERM) => {
+                write!(
+                    f,
+                    "{op}: {source} (network setup needs root; use --network none)"
+                )
+            }
             Error::Netlink { op, source } => write!(f, "{op}: {source}"),
             Error::Nft(reason) => write!(f, "nft: {reason}"),
             Error::NoFreeAddress => write!(f, "no free container address in 10.200.0.0/24"),
@@ -87,7 +81,7 @@ impl fmt::Display for Error {
             Error::Security { op, source } => write!(f, "{op}: {source}"),
             Error::Clone(e) => write!(f, "clone failed (are you root?): {e}"),
             Error::Wait(e) => write!(f, "waitpid failed: {e}"),
-            Error::UnexpectedWaitStatus(status) => write!(f, "unexpected wait status: {status:?}"),
+            Error::UnexpectedWaitStatus(status) => write!(f, "unexpected wait status: {status:#x}"),
             Error::MakeRootPrivate(e) => write!(f, "making / private: {e}"),
             Error::SetHostname(e) => write!(f, "sethostname: {e}"),
             Error::Mount { target, source } => {
@@ -127,11 +121,11 @@ pub fn run(config: &Config) -> Result<u8, Error> {
 
     // Without root, capsule makes its own user namespace and maps our ids to
     // root inside it, so the other namespaces can be created unprivileged.
-    let rootless = !geteuid().is_root();
+    let rootless = sys::geteuid() != 0;
     if rootless && !config.limits.is_empty() {
         return Err(Error::LimitsNeedRoot);
     }
-    let id_map = rootless.then(|| (geteuid(), getegid()));
+    let id_map = rootless.then(|| (sys::geteuid(), sys::getegid()));
 
     // Created before the child exists, so a bad host setup fails cheaply.
     let cgroup = if config.limits.is_empty() {
@@ -168,45 +162,40 @@ pub fn run(config: &Config) -> Result<u8, Error> {
     // The child blocks reading this until the parent has finished its side of
     // the setup (moved it into the cgroup, given it a veth), so the command never runs
     // unconfined. CLOEXEC keeps both ends out of the command.
-    let (ready_rx, ready_tx) = pipe2(OFlag::O_CLOEXEC).map_err(Error::Pipe)?;
+    let (ready_rx, ready_tx) = sys::pipe2(libc::O_CLOEXEC).map_err(Error::Pipe)?;
 
-    let flags = CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWUTS
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWNET;
+    let flags = libc::CLONE_NEWPID | libc::CLONE_NEWUTS | libc::CLONE_NEWNS | libc::CLONE_NEWNET;
     // The kernel creates the user namespace first, then the others owned by it.
     let flags = if rootless {
-        flags | CloneFlags::CLONE_NEWUSER
+        flags | libc::CLONE_NEWUSER
     } else {
         flags
     };
 
     let mut stack = vec![0u8; STACK_SIZE];
-    let child = Box::new(|| match init(&setup, &ready_rx, &ready_tx) {
+    let mut child = || match init(&setup, &ready_rx, &ready_tx) {
         Ok(never) => match never {},
         Err(e) => {
             eprintln!("capsule (child): {e}");
             126
         }
-    });
+    };
 
-    // SAFETY: the child only runs `init`, which execs or returns an exit code.
-    // SIGCHLD lets the parent reap it with waitpid.
-    let pid = unsafe { clone(child, &mut stack, flags, Some(Signal::SIGCHLD as i32)) }
-        .map_err(Error::Clone)?;
+    // The child only runs `init`, which execs or returns an exit code.
+    let pid = sys::clone(&mut child, &mut stack, flags).map_err(Error::Clone)?;
 
     drop(ready_rx);
 
     if let Err(e) = release_child(id_map, cgroup.as_ref(), network.as_ref(), pid, ready_tx) {
         // The write end is gone, so the child sees EOF and exits.
-        let _ = waitpid(pid, None);
+        let _ = sys::waitpid(pid);
         return Err(e);
     }
 
-    let code = match waitpid(pid, None).map_err(Error::Wait)? {
-        WaitStatus::Exited(_, code) => code as u8,
-        WaitStatus::Signaled(_, sig, _) => 128 + sig as u8,
-        other => return Err(Error::UnexpectedWaitStatus(other)),
+    let code = match sys::waitpid(pid).map_err(Error::Wait)? {
+        WaitStatus::Exited(code) => code as u8,
+        WaitStatus::Signaled(sig) => 128 + sig as u8,
+        WaitStatus::Other(status) => return Err(Error::UnexpectedWaitStatus(status)),
     };
 
     if let Some(limit) = cgroup.as_ref().and_then(Cgroup::oom_killed) {
@@ -232,10 +221,10 @@ struct ChildSetup<'a> {
 /// Takes `ready` by value: on error it's dropped unwritten, which the child
 /// reads as EOF and gives up.
 fn release_child(
-    id_map: Option<(Uid, Gid)>,
+    id_map: Option<(uid_t, gid_t)>,
     cgroup: Option<&Cgroup>,
     network: Option<&Network>,
-    pid: Pid,
+    pid: pid_t,
     ready: OwnedFd,
 ) -> Result<(), Error> {
     if let Some((uid, gid)) = id_map {
@@ -247,22 +236,21 @@ fn release_child(
     if let Some(network) = network {
         network.attach(pid)?;
     }
-    write(&ready, &[1]).map_err(Error::Pipe)?;
-    Ok(())
+    File::from(ready).write_all(&[1]).map_err(Error::Pipe)
 }
 
 /// Block until the parent releases us with a byte on `ready_rx`.
 fn wait_for_parent(ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<(), Error> {
     // Our copy of the write end would keep the pipe open forever if the parent
     // died, so close it: then EOF reliably means the parent gave up.
-    close(ready_tx.as_raw_fd()).map_err(Error::Pipe)?;
+    sys::close(ready_tx.as_raw_fd()).map_err(Error::Pipe)?;
 
     let mut byte = [0u8];
     loop {
-        match read(ready_rx, &mut byte) {
+        match sys::read(ready_rx, &mut byte) {
             Ok(1) => return Ok(()),
             Ok(_) => return Err(Error::ParentAborted),
-            Err(Errno::EINTR) => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(Error::Pipe(e)),
         }
     }
@@ -282,16 +270,16 @@ fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<In
     wait_for_parent(ready_rx, ready_tx)?;
 
     // Stop our mount changes propagating back to the host's mount namespace.
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-        None::<&str>,
+    sys::mount(
+        None,
+        Path::new("/"),
+        None,
+        libc::MS_REC | libc::MS_PRIVATE,
+        None,
     )
     .map_err(Error::MakeRootPrivate)?;
 
-    sethostname(&config.hostname).map_err(Error::SetHostname)?;
+    sys::sethostname(&config.hostname).map_err(Error::SetHostname)?;
 
     network::configure(*addr)?;
 
@@ -304,9 +292,9 @@ fn init(setup: &ChildSetup, ready_rx: &OwnedFd, ready_tx: &OwnedFd) -> Result<In
     // environment concurrently.
     unsafe { std::env::set_var("PATH", CONTAINER_PATH) };
 
-    execvpe(&argv[0], argv, env).map_err(|source| Error::Exec {
+    Err(Error::Exec {
         command: argv[0].clone(),
-        source,
+        source: sys::execvpe(&argv[0], argv, env),
     })
 }
 

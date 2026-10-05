@@ -4,12 +4,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use nix::errno::Errno;
-use nix::net::if_::if_nametoindex;
-use nix::unistd::Pid;
+use libc::pid_t;
 
 use crate::container::Error;
 use crate::netlink::Netlink;
+use crate::sys;
 
 const BRIDGE: &str = "capsule0";
 const BRIDGE_ADDR: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
@@ -70,10 +69,10 @@ impl Network {
 
     /// Give the child `pid` a veth pair: `eth0` in its namespace, and a host
     /// end on the bridge. The kernel deletes both when the namespace dies.
-    pub fn attach(&self, pid: Pid) -> Result<(), Error> {
+    pub fn attach(&self, pid: pid_t) -> Result<(), Error> {
         let host_if = format!("vcap{pid}");
         let mut nl = Netlink::open().map_err(netlink("opening netlink socket"))?;
-        nl.create_veth(&host_if, CONTAINER_IF, pid.as_raw() as u32)
+        nl.create_veth(&host_if, CONTAINER_IF, pid as u32)
             .map_err(netlink("creating veth pair"))?;
         let index = index_of(&host_if)?;
         nl.set_master(index, index_of(BRIDGE)?)
@@ -241,12 +240,12 @@ fn container_hosts(addr: Ipv4Addr, hostname: &str) -> String {
 }
 
 fn index_of(name: &str) -> Result<u32, Error> {
-    if_nametoindex(name).map_err(netlink("looking up interface index"))
+    sys::if_nametoindex(name).map_err(netlink("looking up interface index"))
 }
 
-fn ignore_exists(result: Result<(), Errno>) -> Result<(), Errno> {
+fn ignore_exists(result: io::Result<()>) -> io::Result<()> {
     match result {
-        Err(Errno::EEXIST) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         other => other,
     }
 }
@@ -255,7 +254,7 @@ fn write(path: &Path, contents: &str) -> Result<(), Error> {
     fs::write(path, contents).map_err(io_error(path))
 }
 
-fn netlink(op: &'static str) -> impl Fn(Errno) -> Error {
+fn netlink(op: &'static str) -> impl Fn(io::Error) -> Error {
     move |source| Error::Netlink { op, source }
 }
 
